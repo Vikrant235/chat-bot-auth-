@@ -1,12 +1,28 @@
 // chat.js
-// ChatGPT-style multi-chat logic backed by Supabase.
-// Handles: chat list (sidebar), create/select/delete/rename chats,
+// ChatGPT-style multi-chat logic backed by Firebase Firestore.
+// Handles: chat list (sidebar), create/select/delete chats,
 // message loading + sending, and client-side rate-limit enforcement.
+// Data structure: users/{uid}/chats/{chatId} -> { title, createdAt, updatedAt }
+//                 users/{uid}/chats/{chatId}/messages/{msgId} -> { role, content, createdAt }
 
 import CohereService from './cohere-service.js';
-import { supabase } from './supabase-config.js';
+import { firebaseAuth } from './firebase-config.js';
 
-// Limits (also enforced by database triggers — these are for UX)
+import {
+  collection,
+  query,
+  orderBy,
+  onSnapshot,
+  addDoc,
+  deleteDoc,
+  doc,
+  getDocs,
+  serverTimestamp,
+  updateDoc,
+} from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
+import { firebaseDb } from './firebase-config.js';
+
+// Limits (client-enforced — Firestore has no triggers, so this is the enforcement layer)
 const MAX_CHATS = 5;
 const MAX_MESSAGES_PER_CHAT = 20;
 
@@ -29,6 +45,10 @@ let currentChatId = null;
 let chats = [];
 let messageCount = 0;
 let sending = false;
+let currentUid = null;
+let messageUnsub = null;
+let chatUnsub = null;
+let liveMessages = [];
 
 // ---------------- Render helpers ----------------
 
@@ -38,12 +58,13 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-function formatTime(dateStr) {
-  if (!dateStr) return '';
-  return new Date(dateStr).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function formatTime(ts) {
+  if (!ts) return '';
+  const date = ts.toDate ? ts.toDate() : new Date(ts);
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-function renderMessage({ content, role, created_at }) {
+function renderMessage({ content, role, createdAt }) {
   const msgDiv = document.createElement('div');
   msgDiv.className = `message ${role === 'user' ? 'user-message' : 'ai-message'}`;
   const avatarLabel = role === 'user' ? 'You' : 'AI';
@@ -51,7 +72,7 @@ function renderMessage({ content, role, created_at }) {
     <div class="message-avatar">${avatarLabel}</div>
     <div class="message-bubble">
       <div class="message-content"><p>${escapeHtml(content)}</p></div>
-      <div class="message-time">${formatTime(created_at)}</div>
+      <div class="message-time">${formatTime(createdAt)}</div>
     </div>
   `;
   chatMessages.appendChild(msgDiv);
@@ -64,26 +85,33 @@ function clearMessages() {
 
 // ---------------- Chat list (sidebar) ----------------
 
-async function loadChats() {
-  const { data, error } = await supabase
-    .from('chats')
-    .select('id, title, created_at, updated_at')
-    .order('updated_at', { ascending: false });
+function chatsRef(uid) {
+  return collection(firebaseDb, 'users', uid, 'chats');
+}
 
-  if (error) {
-    console.error('Failed to load chats:', error);
-    return;
-  }
-  chats = data || [];
-  renderChatList();
-  updateNewChatButtonState();
+function messagesRef(uid, chatId) {
+  return collection(firebaseDb, 'users', uid, 'chats', chatId, 'messages');
+}
 
-  // Auto-select the most recent chat, or show empty state
-  if (chats.length > 0 && !currentChatId) {
-    await selectChat(chats[0].id);
-  } else if (chats.length === 0) {
-    showEmptyState();
-  }
+function loadChats(uid) {
+  if (chatUnsub) { chatUnsub(); chatUnsub = null; }
+
+  const q = query(chatsRef(uid), orderBy('updatedAt', 'desc'));
+  chatUnsub = onSnapshot(q, (snapshot) => {
+    chats = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+    renderChatList();
+    updateNewChatButtonState();
+
+    // Auto-select the most recent chat if none selected
+    if (chats.length > 0 && !currentChatId) {
+      selectChat(chats[0].id);
+    } else if (chats.length === 0) {
+      showEmptyState();
+    }
+  }, (err) => {
+    console.error('Failed to listen to chats:', err);
+    showToast('Could not load chats. Check your Firebase configuration.');
+  });
 }
 
 function renderChatList() {
@@ -126,39 +154,32 @@ function updateNewChatButtonState() {
   if (!newChatBtn) return;
   const atLimit = chats.length >= MAX_CHATS;
   newChatBtn.disabled = atLimit;
-  newChatBtn.title = atLimit ? `Limit reached: max ${MAX_CHATS} chats. Delete one to create a new chat.` : 'Start a new chat';
+  newChatBtn.title = atLimit
+    ? `Limit reached: max ${MAX_CHATS} chats. Delete one to create a new chat.`
+    : 'Start a new chat';
 }
 
 // ---------------- Chat CRUD ----------------
 
 async function createChat() {
+  if (!currentUid) return;
   if (chats.length >= MAX_CHATS) {
     showToast(`You can have at most ${MAX_CHATS} chats. Delete one first.`);
     return;
   }
 
-  const { data, error } = await supabase
-    .from('chats')
-    .insert({ title: 'New Chat' })
-    .select('id, title, created_at, updated_at')
-    .single();
-
-  if (error) {
-    if (error.message?.includes('CHAT_LIMIT_REACHED')) {
-      showToast(`Chat limit reached (${MAX_CHATS}). Delete one to start a new chat.`);
-      await loadChats();
-    } else {
-      console.error('Failed to create chat:', error);
-      showToast('Could not create chat.');
-    }
-    return;
+  try {
+    const docRef = await addDoc(chatsRef(currentUid), {
+      title: 'New Chat',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    // The onSnapshot listener will pick up the new chat and auto-select it
+    currentChatId = docRef.id;
+  } catch (err) {
+    console.error('Failed to create chat:', err);
+    showToast('Could not create chat. Check your Firebase configuration.');
   }
-
-  chats.unshift(data);
-  renderChatList();
-  updateNewChatButtonState();
-  await selectChat(data.id);
-  autoCollapseSidebarOnMobile();
 }
 
 async function selectChat(chatId) {
@@ -174,62 +195,66 @@ async function selectChat(chatId) {
 }
 
 async function deleteChat(chatId) {
-  const { error } = await supabase.from('chats').delete().eq('id', chatId);
-  if (error) {
-    console.error('Failed to delete chat:', error);
-    showToast('Could not delete chat.');
-    return;
-  }
+  if (!currentUid) return;
 
-  chats = chats.filter((c) => c.id !== chatId);
+  try {
+    // Delete all messages in the subcollection first
+    const msgsSnap = await getDocs(messagesRef(currentUid, chatId));
+    const deletes = msgsSnap.docs.map((d) => deleteDoc(d.ref));
+    await Promise.all(deletes);
 
-  if (currentChatId === chatId) {
-    currentChatId = null;
-    clearMessages();
-    if (chats.length > 0) {
-      await selectChat(chats[0].id);
-    } else {
-      showEmptyState();
+    // Then delete the chat document
+    await deleteDoc(doc(firebaseDb, 'users', currentUid, 'chats', chatId));
+
+    if (currentChatId === chatId) {
+      currentChatId = null;
+      clearMessages();
+      if (chats.length > 0) {
+        await selectChat(chats[0].id);
+      } else {
+        showEmptyState();
+      }
     }
+    renderChatList();
+    updateNewChatButtonState();
+  } catch (err) {
+    console.error('Failed to delete chat:', err);
+    showToast('Could not delete chat.');
   }
-  renderChatList();
-  updateNewChatButtonState();
 }
 
 // ---------------- Messages ----------------
 
-async function loadMessages(chatId) {
+function loadMessages(chatId) {
+  if (messageUnsub) { messageUnsub(); messageUnsub = null; }
+
   clearMessages();
   messageCount = 0;
+  liveMessages = [];
   hideMessageLimitBanner();
   setInputsDisabled(false);
 
-  const { data, error } = await supabase
-    .from('messages')
-    .select('id, role, content, created_at')
-    .eq('chat_id', chatId)
-    .order('created_at', { ascending: true });
+  const q = query(messagesRef(currentUid, chatId), orderBy('createdAt', 'asc'));
+  messageUnsub = onSnapshot(q, (snapshot) => {
+    clearMessages();
+    liveMessages = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+    messageCount = liveMessages.length;
 
-  if (error) {
-    console.error('Failed to load messages:', error);
+    if (liveMessages.length === 0) {
+      showEmptyChatPlaceholder();
+      return;
+    }
+
+    liveMessages.forEach(renderMessage);
+    updateMessageLimitUX();
+  }, (err) => {
+    console.error('Failed to listen to messages:', err);
     showToast('Could not load messages.');
-    return;
-  }
-
-  if (!data || data.length === 0) {
-    showEmptyChatPlaceholder();
-    return;
-  }
-
-  data.forEach(renderMessage);
-  messageCount = data.length;
-  updateMessageLimitUX();
+  });
 }
 
 async function sendMessage(text) {
-  if (sending) return;
-  if (!currentChatId) { await createChat(); }
-  if (!currentChatId) return;
+  if (sending || !currentChatId || !currentUid) return;
   if (messageCount >= MAX_MESSAGES_PER_CHAT) {
     showToast(`This chat is full (${MAX_MESSAGES_PER_CHAT} messages). Start a new chat.`);
     return;
@@ -239,47 +264,38 @@ async function sendMessage(text) {
   setInputsDisabled(true);
   typingIndicator.classList.add('show');
 
-  // Clear any empty-state placeholder before rendering
+  // Clear any placeholder before rendering
   const placeholder = chatMessages.querySelector('.empty-state, .empty-chat-placeholder');
   if (placeholder) placeholder.remove();
 
-  // Optimistic render
-  const userMsg = { content: text, role: 'user', created_at: new Date().toISOString() };
-  renderMessage(userMsg);
-
   try {
     // Build chat history for Cohere from loaded messages
-    const history = await buildChatHistory(text);
+    const history = buildChatHistory();
     const aiResponse = await cohere.generateResponse(text, history);
 
-    // Persist both messages to Supabase
-    const inserts = [
-      { chat_id: currentChatId, role: 'user', content: text },
-      { chat_id: currentChatId, role: 'assistant', content: aiResponse },
-    ];
-    const { data: inserted, error } = await supabase
-      .from('messages')
-      .insert(inserts)
-      .select('id, role, content, created_at');
+    // Save the user message
+    await addDoc(messagesRef(currentUid, currentChatId), {
+      role: 'user',
+      content: text,
+      createdAt: serverTimestamp(),
+    });
 
-    if (error) {
-      if (error.message?.includes('MESSAGE_LIMIT_REACHED')) {
-        showToast(`This chat reached the ${MAX_MESSAGES_PER_CHAT}-message limit.`);
-        // Reload to get accurate server state
-        await loadMessages(currentChatId);
-      } else {
-        throw error;
-      }
-    } else if (inserted) {
-      messageCount += inserted.length;
-      // Render the AI message with server timestamp
-      const aiRow = inserted.find((m) => m.role === 'assistant');
-      if (aiRow) renderMessage(aiRow);
-      updateMessageLimitUX();
-    }
+    // Save the AI message
+    await addDoc(messagesRef(currentUid, currentChatId), {
+      role: 'assistant',
+      content: aiResponse,
+      createdAt: serverTimestamp(),
+    });
+
+    // Touch the chat's updatedAt so it bubbles to the top of the sidebar
+    await updateDoc(doc(firebaseDb, 'users', currentUid, 'chats', currentChatId), {
+      updatedAt: serverTimestamp(),
+    });
+
+    // The onSnapshot listener will render both messages and update messageCount
   } catch (err) {
     console.error('Send failed:', err);
-    renderMessage({ content: 'Sorry, something went wrong. Please try again.', role: 'ai', created_at: new Date().toISOString() });
+    showToast('Could not send message. Please try again.');
   } finally {
     typingIndicator.classList.remove('show');
     sending = false;
@@ -288,17 +304,12 @@ async function sendMessage(text) {
   }
 }
 
-async function buildChatHistory(latestUserText) {
-  // Gather existing messages for Cohere chat_history format
-  const existing = Array.from(chatMessages.querySelectorAll('.message'))
-    .map((el) => {
-      const isUser = el.classList.contains('user-message');
-      const text = el.querySelector('.message-content p')?.textContent || '';
-      return { role: isUser ? 'USER' : 'CHATBOT', message: text };
-    })
-    .filter((m) => m.message);
-  // The latest user message is passed as `message` to Cohere, not in history
-  return existing.filter((m) => m.message !== latestUserText);
+function buildChatHistory() {
+  // Cohere expects { role: 'USER'|'CHATBOT', message: string }
+  return liveMessages.map((m) => ({
+    role: m.role === 'user' ? 'USER' : 'CHATBOT',
+    message: m.content,
+  }));
 }
 
 function updateMessageLimitUX() {
@@ -371,6 +382,20 @@ function showToast(msg) {
   toastTimer = setTimeout(() => toast.classList.remove('show'), 3500);
 }
 
+// ---------------- Sidebar toggle ----------------
+
+const sidebar = document.querySelector('.chat-sidebar');
+const sidebarToggle = document.getElementById('sidebarToggle');
+const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+
+function toggleSidebar() { sidebar?.classList.toggle('collapsed'); }
+sidebarToggle?.addEventListener('click', toggleSidebar);
+mobileMenuBtn?.addEventListener('click', toggleSidebar);
+
+function autoCollapseSidebarOnMobile() {
+  if (window.innerWidth <= 768) sidebar?.classList.add('collapsed');
+}
+
 // ---------------- Event wiring ----------------
 
 chatForm.addEventListener('submit', (e) => {
@@ -383,29 +408,19 @@ chatForm.addEventListener('submit', (e) => {
 
 newChatBtn?.addEventListener('click', createChat);
 
-// Sidebar toggle (desktop + mobile)
-const sidebar = document.querySelector('.chat-sidebar');
-const sidebarToggle = document.getElementById('sidebarToggle');
-const mobileMenuBtn = document.getElementById('mobileMenuBtn');
-
-function toggleSidebar() { sidebar?.classList.toggle('collapsed'); }
-sidebarToggle?.addEventListener('click', toggleSidebar);
-mobileMenuBtn?.addEventListener('click', toggleSidebar);
-
-// On mobile, collapse sidebar when a chat is selected
-function autoCollapseSidebarOnMobile() {
-  if (window.innerWidth <= 768) sidebar?.classList.add('collapsed');
-}
-
-// Auth state
-window.addEventListener('user-signed-in', () => {
+window.addEventListener('user-signed-in', (e) => {
+  currentUid = e.detail.uid;
   setInputsDisabled(false);
-  loadChats();
+  loadChats(currentUid);
 });
 
 window.addEventListener('user-signed-out', () => {
+  if (messageUnsub) { messageUnsub(); messageUnsub = null; }
+  if (chatUnsub) { chatUnsub(); chatUnsub = null; }
+  currentUid = null;
   currentChatId = null;
   chats = [];
+  liveMessages = [];
   messageCount = 0;
   clearMessages();
   renderChatList();
@@ -413,13 +428,3 @@ window.addEventListener('user-signed-out', () => {
   if (chatTitle) chatTitle.textContent = 'AI Chatbot';
   hideMessageLimitBanner();
 });
-
-// Enable input once signed in (safety check)
-const readyCheck = setInterval(() => {
-  supabase.auth.getSession().then(({ data }) => {
-    if (data.session) {
-      setInputsDisabled(false);
-      clearInterval(readyCheck);
-    }
-  });
-}, 300);

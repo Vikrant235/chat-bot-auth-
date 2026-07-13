@@ -1,7 +1,14 @@
 // auth.js
-// Handles Supabase email/password authentication for the chat app.
-// REQUIRES: supabase-config.js loaded first.
-import { supabase } from './supabase-config.js';
+// Handles Firebase email/password authentication for the chat app.
+// REQUIRES: firebase-config.js loaded first.
+
+import {
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+} from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js';
+import { firebaseAuth } from './firebase-config.js';
 
 const authUI = document.getElementById('authUI');
 const userInfo = document.getElementById('userInfo');
@@ -59,14 +66,9 @@ function bindAuthForm() {
 
       try {
         if (isRegister) {
-          const { data, error } = await supabase.auth.signUp({ email, password });
-          if (error) throw error;
-          if (data.user && data.session === null) {
-            showAuthError('Check your email for a confirmation link to finish signing up.');
-          }
+          await createUserWithEmailAndPassword(firebaseAuth, email, password);
         } else {
-          const { error } = await supabase.auth.signInWithPassword({ email, password });
-          if (error) throw error;
+          await signInWithEmailAndPassword(firebaseAuth, email, password);
         }
       } catch (err) {
         handleAuthError(err);
@@ -88,13 +90,21 @@ function clearAuthError() {
 }
 
 function handleAuthError(err) {
-  const msg = (err.message || '').toLowerCase();
-  if (msg.includes('invalid login') || msg.includes('invalid credentials')) {
+  const code = err.code || '';
+  if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
     showAuthError('Incorrect email or password.');
-  } else if (msg.includes('already registered') || msg.includes('already been registered')) {
+  } else if (code === 'auth/email-already-in-use') {
     showAuthError('This email is already registered. Try signing in.');
-  } else if (msg.includes('rate limit') || msg.includes('too many')) {
+  } else if (code === 'auth/too-many-requests') {
     showAuthError('Too many attempts. Please wait a moment and try again.');
+  } else if (code === 'auth/invalid-email') {
+    showAuthError('That email address looks invalid.');
+  } else if (code === 'auth/weak-password') {
+    showAuthError('Password should be at least 6 characters.');
+  } else if (code === 'auth/network-request-failed') {
+    showAuthError('Network error. Check your connection and try again.');
+  } else if (code === 'auth/api-key-not-valid' || code === 'auth/api-key-not-valid.-please-pass-a-valid-api-key.' || code === 'auth/internal-error') {
+    showAuthError('Firebase is not configured. Add your project credentials in js/firebase-config.js.');
   } else {
     showAuthError(err.message || 'Authentication error occurred.');
   }
@@ -112,30 +122,23 @@ function showUserInfo(user) {
       <button id="signOutBtn" class="sign-out-btn" title="Sign out">Sign out</button>
     </div>
   `;
-  document.getElementById('signOutBtn').onclick = () => supabase.auth.signOut();
+  document.getElementById('signOutBtn').onclick = () => signOut(firebaseAuth);
 }
 
-supabase.auth.onAuthStateChange((event, session) => {
-  (async () => {
-    const user = session?.user ?? null;
-    if (user) {
-      authUI.style.display = 'none';
-      userInfo.style.display = '';
-      chatContainer.style.display = 'flex';
-      if (sidebar) sidebar.style.display = 'flex';
-      showUserInfo(user);
-      window.dispatchEvent(new CustomEvent('user-signed-in', { detail: user }));
-    } else {
-      authUI.style.display = '';
-      userInfo.style.display = 'none';
-      chatContainer.style.display = 'none';
-      if (sidebar) sidebar.style.display = 'none';
-      window.dispatchEvent(new CustomEvent('user-signed-out'));
-      showAuthUI();
-    }
-  })();
+onAuthStateChanged(firebaseAuth, (user) => {
+  if (user) {
+    authUI.style.display = 'none';
+    userInfo.style.display = '';
+    chatContainer.style.display = 'flex';
+    if (sidebar) sidebar.style.display = 'flex';
+    showUserInfo(user);
+    window.dispatchEvent(new CustomEvent('user-signed-in', { detail: { uid: user.uid, email: user.email } }));
+  } else {
+    authUI.style.display = '';
+    userInfo.style.display = 'none';
+    chatContainer.style.display = 'none';
+    if (sidebar) sidebar.style.display = 'none';
+    window.dispatchEvent(new CustomEvent('user-signed-out'));
+    showAuthUI();
+  }
 });
-
-export function getCurrentUser() {
-  return supabase.auth.getUser();
-}
