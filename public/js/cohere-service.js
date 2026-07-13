@@ -2,7 +2,7 @@
 // This module handles interactions with the Cohere AI API for generating responses using the Chat API.
 export default class CohereService {
     constructor() {
-        this.apiKey = 'cohere_efjRTjSAFvxFiKwFoeQjH42l2685sPqaNRGIPmq93OGJT3'; // <-- Add your Cohere Trial API key here
+        this.apiKey = ''; // <-- Add your Cohere Trial API key here
         this.apiUrl = 'https://api.cohere.ai/v1/chat';
         this.conversationHistory = [];
     }
